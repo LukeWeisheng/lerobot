@@ -46,6 +46,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.cameras.gemini335l.configuration_gemini335l import Gemini335LCameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.robots import (  # noqa: F401
