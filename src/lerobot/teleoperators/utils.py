@@ -49,6 +49,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .so101_leader import SO101Leader
 
         return SO101Leader(config)
+    elif config.type == "zionnerP1_leader":
+        from .zionnerP1_leader import ZionnerP1Leader
+
+        return ZionnerP1Leader(config)
     elif config.type == "mock_teleop":
         from tests.mocks.mock_teleop import MockTeleop
 

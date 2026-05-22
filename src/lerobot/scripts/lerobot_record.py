@@ -99,6 +99,7 @@ from lerobot.robots import (  # noqa: F401
     make_robot_from_config,
     so100_follower,
     so101_follower,
+    zionnerP1_follower,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
@@ -109,6 +110,7 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     so100_leader,
     so101_leader,
+    zionnerP1_leader,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -270,7 +272,12 @@ def record_loop(
                 for t in teleop
                 if isinstance(
                     t,
-                    (so100_leader.SO100Leader | so101_leader.SO101Leader | koch_leader.KochLeader),
+                    (
+                        so100_leader.SO100Leader
+                        | so101_leader.SO101Leader
+                        | zionnerP1_leader.ZionnerP1Leader
+                        | koch_leader.KochLeader
+                    ),
                 )
             ),
             None,
