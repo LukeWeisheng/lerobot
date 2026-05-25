@@ -500,6 +500,30 @@ class Gemini335LCamera(Camera):
             raise RuntimeError(f"{self} read_depth failed: missing depth frame.")
         return depth_map
 
+    @staticmethod
+    def pack_depth_for_storage(depth_map: NDArray[Any]) -> NDArray[Any]:
+        if depth_map.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D depth map, but got shape {depth_map.shape}."
+            )
+
+        depth_uint16 = depth_map.astype(np.uint16, copy=False)
+        packed = np.zeros((*depth_uint16.shape, 3), dtype=np.uint8)
+        packed[..., 0] = (depth_uint16 & 0xFF).astype(np.uint8)
+        packed[..., 1] = ((depth_uint16 >> 8) & 0xFF).astype(np.uint8)
+        return packed
+
+    @staticmethod
+    def unpack_depth_from_storage(packed_depth: NDArray[Any]) -> NDArray[Any]:
+        if packed_depth.ndim != 3 or packed_depth.shape[2] != 3:
+            raise ValueError(
+                f"Expected a packed depth image with shape (H, W, 3), but got {packed_depth.shape}."
+            )
+
+        low = packed_depth[..., 0].astype(np.uint16)
+        high = packed_depth[..., 1].astype(np.uint16)
+        return low | (high << 8)
+
     def get_device_info(self) -> dict[str, Any]:
         return dict(self.device_info)
 

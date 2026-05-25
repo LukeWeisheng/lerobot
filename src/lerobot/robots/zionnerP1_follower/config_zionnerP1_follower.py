@@ -17,6 +17,8 @@
 from dataclasses import dataclass, field
 
 from lerobot.cameras import CameraConfig
+from lerobot.cameras.gemini335l import Gemini335LCameraConfig
+from lerobot.cameras.configs import ColorMode
 
 from ..config import RobotConfig
 
@@ -31,4 +33,38 @@ class ZionnerP1FollowerConfig(RobotConfig):
     use_realtime: bool = True
     rt_move_duration: float = 0.05
     rt_network_tolerance: int = 100
+    enable_default_cameras: bool = True
+    arm_camera_serial_number: str = "CP2N1630006X"
+    head_camera_serial_number: str = "CP26363000BJ"
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.enable_default_cameras and not self.cameras:
+            self.cameras = {
+                "arm_camera": Gemini335LCameraConfig(
+                    serial_number_or_name=self.arm_camera_serial_number,
+                    width=1280,
+                    height=720,
+                    fps=30,
+                    color_mode=ColorMode.RGB,
+                    use_depth=True,
+                    depth_width=848,
+                    depth_height=480,
+                    depth_fps=30,
+                    enable_frame_sync=True,
+                ),
+                "head_camera": Gemini335LCameraConfig(
+                    serial_number_or_name=self.head_camera_serial_number,
+                    width=1280,
+                    height=720,
+                    fps=30,
+                    color_mode=ColorMode.RGB,
+                    use_depth=True,
+                    depth_width=848,
+                    depth_height=480,
+                    depth_fps=30,
+                    enable_frame_sync=True,
+                ),
+            }
+
+        super().__post_init__()

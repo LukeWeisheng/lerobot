@@ -17,8 +17,10 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
+from lerobot.cameras.gemini335l import Gemini335LCameraConfig
 from lerobot.robots import make_robot_from_config
 from lerobot.robots.zionnerP1_follower import (
     ZIONNER_P1_JOINTS,
@@ -59,6 +61,33 @@ def _make_client_mock(*args, **kwargs):
     return client
 
 
+def _make_camera_mock(config):
+    camera = MagicMock(name=f"CameraMock:{getattr(config, 'serial_number_or_name', 'cam')}")
+    camera.is_connected = False
+    camera.use_depth = getattr(config, "use_depth", False)
+
+    color = np.zeros((config.height, config.width, 3), dtype=np.uint8)
+    depth = None
+    if camera.use_depth:
+        depth = np.full(
+            (config.depth_height, config.depth_width),
+            1024,
+            dtype=np.uint16,
+        )
+
+    def connect():
+        camera.is_connected = True
+
+    def disconnect():
+        camera.is_connected = False
+
+    camera.connect.side_effect = connect
+    camera.disconnect.side_effect = disconnect
+    camera.async_read.return_value = color
+    camera.read_frame_bundle.return_value = {"color": color, "depth": depth}
+    return camera
+
+
 @pytest.fixture
 def patched_zionner_clients():
     with (
@@ -76,6 +105,15 @@ def patched_zionner_clients():
             ),
             side_effect=_make_client_mock,
         ),
+        patch(
+            "lerobot.cameras.gemini335l.Gemini335LCamera",
+            side_effect=_make_camera_mock,
+        ),
+        patch(
+            "lerobot.cameras.utils.Gemini335LCamera",
+            side_effect=_make_camera_mock,
+            create=True,
+        ),
     ):
         yield
 
@@ -89,13 +127,20 @@ def test_make_zionner_devices_from_config(patched_zionner_clients):
     assert follower.config.type == "zionnerP1_follower"
     assert leader.config.type == "zionnerP1_leader"
     assert follower.config.use_realtime is True
+    assert set(follower.config.cameras) == {"arm_camera", "head_camera"}
 
 
 def test_zionner_features_and_io(patched_zionner_clients):
     follower = ZionnerP1Follower(ZionnerP1FollowerConfig())
     leader = ZionnerP1Leader(ZionnerP1LeaderConfig())
 
-    assert set(follower.observation_features) == set(ZIONNER_P1_JOINTS)
+    expected_observation_keys = set(ZIONNER_P1_JOINTS) | {
+        "arm_camera",
+        "arm_camera_depth",
+        "head_camera",
+        "head_camera_depth",
+    }
+    assert set(follower.observation_features) == expected_observation_keys
     assert set(follower.action_features) == set(ZIONNER_P1_JOINTS)
     assert set(leader.action_features) == set(ZIONNER_P1_JOINTS)
     assert leader.feedback_features == {}
@@ -110,7 +155,12 @@ def test_zionner_features_and_io(patched_zionner_clients):
         for index, joint_name in enumerate(ZIONNER_P1_JOINTS)
     }
 
-    assert observation == action == expected
+    for joint_name, joint_value in expected.items():
+        assert observation[joint_name] == action[joint_name] == joint_value
+    assert observation["arm_camera"].shape == (720, 1280, 3)
+    assert observation["head_camera"].shape == (720, 1280, 3)
+    assert observation["arm_camera_depth"].shape == (480, 848, 3)
+    assert observation["head_camera_depth"].shape == (480, 848, 3)
 
     sent_action = follower.send_action(action)
     assert sent_action == action
@@ -124,6 +174,32 @@ def test_zionner_features_and_io(patched_zionner_clients):
     follower.disconnect()
 
 
+def test_default_camera_config_uses_serial_mapping():
+    config = ZionnerP1FollowerConfig(enable_default_cameras=True)
+
+    arm_config = config.cameras["arm_camera"]
+    head_config = config.cameras["head_camera"]
+
+    assert isinstance(arm_config, Gemini335LCameraConfig)
+    assert isinstance(head_config, Gemini335LCameraConfig)
+    assert arm_config.serial_number_or_name == "CP2N1630006X"
+    assert head_config.serial_number_or_name == "CP26363000BJ"
+    assert arm_config.use_depth is True
+    assert head_config.use_depth is True
+
+
+def test_depth_pack_roundtrip():
+    from lerobot.cameras.gemini335l.camera_gemini335l import Gemini335LCamera
+
+    depth = np.array([[0, 1, 255], [256, 1024, 65535]], dtype=np.uint16)
+    packed = Gemini335LCamera.pack_depth_for_storage(depth)
+    unpacked = Gemini335LCamera.unpack_depth_from_storage(packed)
+
+    assert packed.shape == (2, 3, 3)
+    assert packed.dtype == np.uint8
+    assert np.array_equal(unpacked, depth)
+
+
 def test_zionner_hardware_roundtrip():
     if not _hardware_tests_enabled():
         pytest.skip("Disabled by LEROBOT_RUN_ZIONNERP1_HARDWARE_TESTS=0")
@@ -131,7 +207,10 @@ def test_zionner_hardware_roundtrip():
     follower_ip = os.getenv("LEROBOT_ZIONNERP1_FOLLOWER_IP", "169.254.160.182")
     leader_ip = os.getenv("LEROBOT_ZIONNERP1_LEADER_IP", "169.254.160.160")
     follower = ZionnerP1Follower(
-        ZionnerP1FollowerConfig(ip_address=follower_ip)
+        ZionnerP1FollowerConfig(
+            ip_address=follower_ip,
+            enable_default_cameras=False,
+        )
     )
     leader = ZionnerP1Leader(ZionnerP1LeaderConfig(ip_address=leader_ip))
 

@@ -19,6 +19,7 @@ import time
 from functools import cached_property
 from typing import Any
 
+from lerobot.cameras.gemini335l import Gemini335LCamera
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.utils.errors import (
     DeviceAlreadyConnectedError,
@@ -59,14 +60,20 @@ class ZionnerP1Follower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (
-                self.config.cameras[cam].height,
-                self.config.cameras[cam].width,
+        camera_features: dict[str, tuple] = {}
+        for cam_name, cam_config in self.config.cameras.items():
+            camera_features[cam_name] = (
+                cam_config.height,
+                cam_config.width,
                 3,
             )
-            for cam in self.cameras
-        }
+            if getattr(cam_config, "use_depth", False):
+                camera_features[f"{cam_name}_depth"] = (
+                    getattr(cam_config, "depth_height"),
+                    getattr(cam_config, "depth_width"),
+                    3,
+                )
+        return camera_features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -126,7 +133,16 @@ class ZionnerP1Follower(Robot):
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
         for cam_key, cam in self.cameras.items():
-            observation[cam_key] = cam.async_read()
+            if isinstance(cam, Gemini335LCamera) and cam.use_depth:
+                frame_bundle = cam.read_frame_bundle(timeout_ms=500)
+                observation[cam_key] = frame_bundle["color"]
+                depth_map = frame_bundle["depth"]
+                if depth_map is not None:
+                    observation[f"{cam_key}_depth"] = (
+                        Gemini335LCamera.pack_depth_for_storage(depth_map)
+                    )
+            else:
+                observation[cam_key] = cam.async_read()
 
         return observation
 
