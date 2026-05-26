@@ -58,6 +58,7 @@ lerobot-record \
 ```
 """
 
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass, field
@@ -101,6 +102,8 @@ from lerobot.robots import (  # noqa: F401
     so101_follower,
     zionnerP1_follower,
 )
+from lerobot.robots.zionnerP1_follower import ZIONNER_P1_JOINTS
+from lerobot.robots.vendor.xcore_sdk import XCoreZionnerP1Client
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -113,7 +116,7 @@ from lerobot.teleoperators import (  # noqa: F401
     zionnerP1_leader,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -176,9 +179,17 @@ class DatasetRecordConfig:
 
 
 @dataclass
+class WorkflowConfig:
+    mode: str = "normal"
+    trajectory_json_path: str | Path | None = None
+    teach_power_off: bool = True
+
+
+@dataclass
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
+    workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     # Whether to control the robot with a teleoperator
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
@@ -198,8 +209,25 @@ class RecordConfig:
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
-        if self.teleop is None and self.policy is None:
+        if self.workflow.mode == "normal" and self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
+
+        if self.workflow.mode not in {"normal", "teach", "replay_record"}:
+            raise ValueError(
+                "workflow.mode must be one of {'normal', 'teach', 'replay_record'}"
+            )
+
+        if self.workflow.mode in {"teach", "replay_record"}:
+            if self.robot.type != "zionnerP1_follower":
+                raise ValueError(
+                    "workflow.mode=teach/replay_record currently only supports "
+                    "robot.type=zionnerP1_follower"
+                )
+            if self.teleop is not None or self.policy is not None:
+                raise ValueError(
+                    "workflow.mode=teach/replay_record does not use teleop or policy. "
+                    "Leave both unset."
+                )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -377,10 +405,360 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
-@parser.wrap()
-def record(cfg: RecordConfig) -> LeRobotDataset:
-    init_logging()
-    logging.info(pformat(asdict(cfg)))
+def teach_loop(
+    client: XCoreZionnerP1Client,
+    events: dict,
+    fps: int,
+    control_time_s: int | float | None,
+) -> list[dict[str, Any]]:
+    timestamp = 0.0
+    start_episode_t = time.perf_counter()
+    frames: list[dict[str, Any]] = []
+
+    while control_time_s is None or timestamp < control_time_s:
+        start_loop_t = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+
+        joint_positions = client.read_joint_positions()
+        frames.append(
+            {
+                "timestamp": timestamp,
+                "joints": [float(value) for value in joint_positions],
+            }
+        )
+
+        dt_s = time.perf_counter() - start_loop_t
+        busy_wait(1 / fps - dt_s)
+        timestamp = time.perf_counter() - start_episode_t
+
+    return frames
+
+
+def replay_record_loop(
+    robot: Robot,
+    events: dict,
+    fps: int,
+    robot_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_observation_processor: RobotProcessorPipeline[
+        RobotObservation, RobotObservation
+    ],
+    trajectory_frames: list[dict[str, Any]],
+    dataset: LeRobotDataset | None = None,
+    single_task: str | None = None,
+    display_data: bool = False,
+):
+    for trajectory_frame in trajectory_frames:
+        start_loop_t = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+
+        obs = robot.get_observation()
+        obs_processed = robot_observation_processor(obs)
+        observation_frame = build_dataset_frame(
+            dataset.features,
+            obs_processed,
+            prefix=OBS_STR,
+        )
+
+        action = {
+            joint_name: float(value)
+            for joint_name, value in zip(
+                ZIONNER_P1_JOINTS,
+                trajectory_frame["joints"],
+                strict=True,
+            )
+        }
+        robot_action_to_send = robot_action_processor((action, obs))
+        sent_action = robot.send_action(robot_action_to_send)
+
+        if dataset is not None:
+            action_frame = build_dataset_frame(
+                dataset.features,
+                sent_action,
+                prefix=ACTION,
+            )
+            frame = {**observation_frame, **action_frame, "task": single_task}
+            dataset.add_frame(frame)
+
+        if display_data:
+            log_rerun_data(observation=obs_processed, action=sent_action)
+
+        dt_s = time.perf_counter() - start_loop_t
+        busy_wait(1 / fps - dt_s)
+
+
+def passive_wait_loop(events: dict, control_time_s: int | float) -> None:
+    start_wait_t = time.perf_counter()
+    while time.perf_counter() - start_wait_t < control_time_s:
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+        busy_wait(0.05)
+
+
+def get_trajectory_json_path(cfg: RecordConfig) -> Path:
+    if cfg.workflow.trajectory_json_path is not None:
+        return Path(cfg.workflow.trajectory_json_path)
+
+    dataset_root = (
+        Path(cfg.dataset.root)
+        if cfg.dataset.root is not None
+        else HF_LEROBOT_HOME / cfg.dataset.repo_id
+    )
+    return dataset_root / "trajectory.json"
+
+
+def load_trajectory_payload(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+
+def save_trajectory_payload(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def create_empty_trajectory_payload(cfg: RecordConfig) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "robot_type": cfg.robot.type,
+        "fps": cfg.dataset.fps,
+        "joint_names": list(ZIONNER_P1_JOINTS),
+        "single_task": cfg.dataset.single_task,
+        "episodes": [],
+    }
+
+
+def set_robot_power_state(
+    client: XCoreZionnerP1Client,
+    enabled: bool,
+) -> None:
+    robot = client._require_robot()
+    ec: dict[str, Any] = {}
+    robot.setPowerState(enabled, ec)
+    if ec.get("ec", 0) != 0:
+        raise RuntimeError(f"setPowerState({enabled}) failed: {ec}")
+
+
+def record_teach_trajectory(cfg: RecordConfig) -> Path:
+    trajectory_path = get_trajectory_json_path(cfg)
+    if cfg.resume:
+        if not trajectory_path.exists():
+            raise FileNotFoundError(
+                f"Trajectory JSON not found for resume: {trajectory_path}"
+            )
+        payload = load_trajectory_payload(trajectory_path)
+    else:
+        if trajectory_path.exists():
+            raise FileExistsError(
+                f"Trajectory JSON already exists: {trajectory_path}. "
+                "Use --resume=true or change workflow.trajectory_json_path."
+            )
+        payload = create_empty_trajectory_payload(cfg)
+
+    client = XCoreZionnerP1Client(
+        ip_address=cfg.robot.ip_address,
+        local_ip_address=cfg.robot.local_ip_address,
+        use_realtime=False,
+    )
+    listener = None
+    recorded_episodes = 0
+
+    try:
+        client.connect()
+        if cfg.workflow.teach_power_off:
+            try:
+                set_robot_power_state(client, False)
+            except RuntimeError as error:
+                logging.warning("Failed to power off robot for teach mode: %s", error)
+
+        listener, events = init_keyboard_listener()
+
+        while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+            episode_index = len(payload["episodes"])
+            log_say(f"Recording episode {episode_index}", cfg.play_sounds)
+            frames = teach_loop(
+                client=client,
+                events=events,
+                fps=cfg.dataset.fps,
+                control_time_s=cfg.dataset.episode_time_s,
+            )
+
+            if not events["stop_recording"] and (
+                (recorded_episodes < cfg.dataset.num_episodes - 1)
+                or events["rerecord_episode"]
+            ):
+                log_say("Reset the environment", cfg.play_sounds)
+                passive_wait_loop(events, cfg.dataset.reset_time_s)
+
+            if events["rerecord_episode"]:
+                log_say("Re-record episode", cfg.play_sounds)
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                continue
+
+            payload["episodes"].append(
+                {
+                    "episode_index": episode_index,
+                    "single_task": cfg.dataset.single_task,
+                    "frames": frames,
+                }
+            )
+            save_trajectory_payload(trajectory_path, payload)
+            recorded_episodes += 1
+    finally:
+        client.disconnect()
+        if not is_headless() and listener is not None:
+            listener.stop()
+
+    log_say("Stop recording", cfg.play_sounds, blocking=True)
+    log_say("Exiting", cfg.play_sounds)
+    return trajectory_path
+
+
+def record_replay_dataset(cfg: RecordConfig) -> LeRobotDataset:
+    trajectory_path = get_trajectory_json_path(cfg)
+    if not trajectory_path.exists():
+        raise FileNotFoundError(
+            f"Trajectory JSON not found: {trajectory_path}"
+        )
+
+    trajectory_payload = load_trajectory_payload(trajectory_path)
+    trajectory_fps = int(trajectory_payload["fps"])
+    if trajectory_fps != cfg.dataset.fps:
+        logging.warning(
+            "Trajectory fps (%s) differs from dataset fps (%s). "
+            "Replaying at dataset fps.",
+            trajectory_fps,
+            cfg.dataset.fps,
+        )
+
+    robot = make_robot_from_config(cfg.robot)
+    _, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_action_processor,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=cfg.dataset.video,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=cfg.dataset.video,
+        ),
+    )
+
+    if cfg.resume:
+        dataset = LeRobotDataset(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+        )
+
+        if hasattr(robot, "cameras") and len(robot.cameras) > 0:
+            dataset.start_image_writer(
+                num_processes=cfg.dataset.num_image_writer_processes,
+                num_threads=(
+                    cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras)
+                ),
+            )
+        sanity_check_dataset_robot_compatibility(
+            dataset,
+            robot,
+            cfg.dataset.fps,
+            dataset_features,
+        )
+    else:
+        sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
+        dataset = LeRobotDataset.create(
+            cfg.dataset.repo_id,
+            cfg.dataset.fps,
+            root=cfg.dataset.root,
+            robot_type=robot.name,
+            features=dataset_features,
+            use_videos=cfg.dataset.video,
+            image_writer_processes=cfg.dataset.num_image_writer_processes,
+            image_writer_threads=(
+                cfg.dataset.num_image_writer_threads_per_camera
+                * len(robot.cameras)
+            ),
+            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+        )
+
+    start_trajectory_episode = dataset.num_episodes if cfg.resume else 0
+    trajectory_episodes = trajectory_payload["episodes"]
+    if start_trajectory_episode >= len(trajectory_episodes):
+        raise ValueError(
+            "No remaining trajectory episodes to replay. "
+            f"trajectory_episodes={len(trajectory_episodes)}, "
+            f"start_trajectory_episode={start_trajectory_episode}"
+        )
+
+    robot.connect()
+    listener, events = init_keyboard_listener()
+
+    with VideoEncodingManager(dataset):
+        recorded_episodes = 0
+        trajectory_episode_index = start_trajectory_episode
+        while (
+            recorded_episodes < cfg.dataset.num_episodes
+            and trajectory_episode_index < len(trajectory_episodes)
+            and not events["stop_recording"]
+        ):
+            trajectory_episode = trajectory_episodes[trajectory_episode_index]
+            log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+            replay_record_loop(
+                robot=robot,
+                events=events,
+                fps=cfg.dataset.fps,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                trajectory_frames=trajectory_episode["frames"],
+                dataset=dataset,
+                single_task=cfg.dataset.single_task,
+                display_data=cfg.display_data,
+            )
+
+            if not events["stop_recording"] and (
+                (recorded_episodes < cfg.dataset.num_episodes - 1)
+                or events["rerecord_episode"]
+            ):
+                log_say("Reset the environment", cfg.play_sounds)
+                passive_wait_loop(events, cfg.dataset.reset_time_s)
+
+            if events["rerecord_episode"]:
+                log_say("Re-record episode", cfg.play_sounds)
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                dataset.clear_episode_buffer()
+                continue
+
+            dataset.save_episode()
+            recorded_episodes += 1
+            trajectory_episode_index += 1
+
+    log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+    robot.disconnect()
+    if not is_headless() and listener is not None:
+        listener.stop()
+
+    if cfg.dataset.push_to_hub:
+        dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+
+    log_say("Exiting", cfg.play_sounds)
+    return dataset
+
+
+def record_normal(cfg: RecordConfig) -> LeRobotDataset:
     if cfg.display_data:
         init_rerun(session_name="recording")
 
@@ -517,6 +895,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     log_say("Exiting", cfg.play_sounds)
     return dataset
+
+
+@parser.wrap()
+def record(cfg: RecordConfig) -> LeRobotDataset:
+    init_logging()
+    logging.info(pformat(asdict(cfg)))
+    if cfg.workflow.mode == "teach":
+        record_teach_trajectory(cfg)
+        return None
+    if cfg.workflow.mode == "replay_record":
+        return record_replay_dataset(cfg)
+    return record_normal(cfg)
 
 
 def main():
