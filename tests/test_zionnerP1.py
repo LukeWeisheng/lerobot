@@ -157,10 +157,10 @@ def test_zionner_features_and_io(patched_zionner_clients):
 
     for joint_name, joint_value in expected.items():
         assert observation[joint_name] == action[joint_name] == joint_value
-    assert observation["arm_camera"].shape == (720, 1280, 3)
-    assert observation["head_camera"].shape == (720, 1280, 3)
-    assert observation["arm_camera_depth"].shape == (480, 848, 3)
-    assert observation["head_camera_depth"].shape == (480, 848, 3)
+    assert observation["arm_camera"].shape == (480, 640, 3)
+    assert observation["head_camera"].shape == (480, 640, 3)
+    assert observation["arm_camera_depth"].shape == (480, 640, 3)
+    assert observation["head_camera_depth"].shape == (480, 640, 3)
 
     sent_action = follower.send_action(action)
     assert sent_action == action
@@ -186,6 +186,14 @@ def test_default_camera_config_uses_serial_mapping():
     assert head_config.serial_number_or_name == "CP26363000BJ"
     assert arm_config.use_depth is True
     assert head_config.use_depth is True
+    assert arm_config.width == 640
+    assert arm_config.height == 480
+    assert arm_config.depth_width == 640
+    assert arm_config.depth_height == 480
+    assert head_config.width == 640
+    assert head_config.height == 480
+    assert head_config.depth_width == 640
+    assert head_config.depth_height == 480
 
 
 def test_depth_pack_roundtrip():

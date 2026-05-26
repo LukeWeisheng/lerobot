@@ -451,15 +451,58 @@ def replay_record_loop(
     dataset: LeRobotDataset | None = None,
     single_task: str | None = None,
     display_data: bool = False,
-):
-    for trajectory_frame in trajectory_frames:
+    episode_index: int | None = None,
+    control_time_s: int | float | None = None,
+) -> dict[str, float | int]:
+    trajectory_timestamps = [
+        float(frame.get("timestamp", index / fps))
+        for index, frame in enumerate(trajectory_frames)
+    ]
+    trajectory_duration_s = (
+        trajectory_timestamps[-1] if trajectory_timestamps else 0.0
+    )
+    target_duration_s = trajectory_duration_s
+    if control_time_s is not None:
+        target_duration_s = min(target_duration_s, float(control_time_s))
+
+    total_frames = 0
+    total_observation_s = 0.0
+    total_action_s = 0.0
+    total_add_frame_s = 0.0
+    total_loop_s = 0.0
+    max_observation_s = 0.0
+    max_action_s = 0.0
+    max_loop_s = 0.0
+    selected_frame_index = 0
+    max_source_frame_index = 0
+    start_episode_t = time.perf_counter()
+
+    while trajectory_frames:
         start_loop_t = time.perf_counter()
+        elapsed_s = start_loop_t - start_episode_t
+
+        if elapsed_s >= target_duration_s:
+            break
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
+        while (
+            selected_frame_index + 1 < len(trajectory_frames)
+            and trajectory_timestamps[selected_frame_index + 1] <= elapsed_s
+        ):
+            selected_frame_index += 1
+
+        max_source_frame_index = max(
+            max_source_frame_index,
+            selected_frame_index,
+        )
+        trajectory_frame = trajectory_frames[selected_frame_index]
+
+        start_observation_t = time.perf_counter()
         obs = robot.get_observation()
+        observation_dt_s = time.perf_counter() - start_observation_t
         obs_processed = robot_observation_processor(obs)
         observation_frame = build_dataset_frame(
             dataset.features,
@@ -476,9 +519,13 @@ def replay_record_loop(
             )
         }
         robot_action_to_send = robot_action_processor((action, obs))
+        start_action_t = time.perf_counter()
         sent_action = robot.send_action(robot_action_to_send)
+        action_dt_s = time.perf_counter() - start_action_t
 
+        add_frame_dt_s = 0.0
         if dataset is not None:
+            start_add_frame_t = time.perf_counter()
             action_frame = build_dataset_frame(
                 dataset.features,
                 sent_action,
@@ -486,12 +533,36 @@ def replay_record_loop(
             )
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
+            add_frame_dt_s = time.perf_counter() - start_add_frame_t
 
         if display_data:
             log_rerun_data(observation=obs_processed, action=sent_action)
 
         dt_s = time.perf_counter() - start_loop_t
+        total_frames += 1
+        total_observation_s += observation_dt_s
+        total_action_s += action_dt_s
+        total_add_frame_s += add_frame_dt_s
+        total_loop_s += dt_s
+        max_observation_s = max(max_observation_s, observation_dt_s)
+        max_action_s = max(max_action_s, action_dt_s)
+        max_loop_s = max(max_loop_s, dt_s)
+
         busy_wait(1 / fps - dt_s)
+
+    return {
+        "frames": total_frames,
+        "total_observation_s": total_observation_s,
+        "total_action_s": total_action_s,
+        "total_add_frame_s": total_add_frame_s,
+        "total_loop_s": total_loop_s,
+        "max_observation_s": max_observation_s,
+        "max_action_s": max_action_s,
+        "max_loop_s": max_loop_s,
+        "trajectory_duration_s": trajectory_duration_s,
+        "target_duration_s": target_duration_s,
+        "last_source_frame_index": max_source_frame_index,
+    }
 
 
 def passive_wait_loop(events: dict, control_time_s: int | float) -> None:
@@ -713,9 +784,11 @@ def record_replay_dataset(cfg: RecordConfig) -> LeRobotDataset:
             and trajectory_episode_index < len(trajectory_episodes)
             and not events["stop_recording"]
         ):
+            current_episode_index = dataset.num_episodes
             trajectory_episode = trajectory_episodes[trajectory_episode_index]
-            log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-            replay_record_loop(
+            log_say(f"Recording episode {current_episode_index}", cfg.play_sounds)
+            episode_start_t = time.perf_counter()
+            replay_stats = replay_record_loop(
                 robot=robot,
                 events=events,
                 fps=cfg.dataset.fps,
@@ -725,6 +798,23 @@ def record_replay_dataset(cfg: RecordConfig) -> LeRobotDataset:
                 dataset=dataset,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
+                episode_index=current_episode_index,
+                control_time_s=cfg.dataset.episode_time_s,
+            )
+            logging.info(
+                "Replay episode %s summary: frames=%s wall=%.3fs trajectory_duration=%.3fs target_duration=%.3fs last_source_frame=%s obs_total=%.3fs action_total=%.3fs add_frame_total=%.3fs max_obs=%.3fs max_action=%.3fs max_loop=%.3fs",
+                current_episode_index,
+                replay_stats["frames"],
+                time.perf_counter() - episode_start_t,
+                replay_stats["trajectory_duration_s"],
+                replay_stats["target_duration_s"],
+                replay_stats["last_source_frame_index"],
+                replay_stats["total_observation_s"],
+                replay_stats["total_action_s"],
+                replay_stats["total_add_frame_s"],
+                replay_stats["max_observation_s"],
+                replay_stats["max_action_s"],
+                replay_stats["max_loop_s"],
             )
 
             if not events["stop_recording"] and (
@@ -732,7 +822,13 @@ def record_replay_dataset(cfg: RecordConfig) -> LeRobotDataset:
                 or events["rerecord_episode"]
             ):
                 log_say("Reset the environment", cfg.play_sounds)
+                reset_start_t = time.perf_counter()
                 passive_wait_loop(events, cfg.dataset.reset_time_s)
+                logging.info(
+                    "Replay episode %s reset wait: %.3fs",
+                    current_episode_index,
+                    time.perf_counter() - reset_start_t,
+                )
 
             if events["rerecord_episode"]:
                 log_say("Re-record episode", cfg.play_sounds)
@@ -741,7 +837,13 @@ def record_replay_dataset(cfg: RecordConfig) -> LeRobotDataset:
                 dataset.clear_episode_buffer()
                 continue
 
+            save_start_t = time.perf_counter()
             dataset.save_episode()
+            logging.info(
+                "Replay episode %s save_episode: %.3fs",
+                current_episode_index,
+                time.perf_counter() - save_start_t,
+            )
             recorded_episodes += 1
             trajectory_episode_index += 1
 

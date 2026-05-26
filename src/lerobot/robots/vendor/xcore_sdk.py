@@ -92,6 +92,9 @@ class XCoreZionnerP1Client:
         self._robot: Any | None = None
         self._rt_controller: Any | None = None
         self._rt_configured = False
+        self._rt_loop_started = False
+        self._rt_target_joint_positions: list[float] | None = None
+        self._rt_finish_loop = False
         self._is_connected = False
 
     @property
@@ -137,6 +140,9 @@ class XCoreZionnerP1Client:
         _assert_success(ec, "setPowerState")
         self._rt_controller = robot.getRtMotionController()
         self._rt_configured = True
+        self._rt_loop_started = False
+        self._rt_target_joint_positions = None
+        self._rt_finish_loop = False
 
     def configure_joint_control(self, force: bool = False) -> None:
         if self.use_realtime:
@@ -197,12 +203,8 @@ class XCoreZionnerP1Client:
 
         if self.use_realtime:
             self.configure_realtime_joint_control()
-            current_joint_positions = self.read_joint_positions()
-            self._require_rt_controller().MoveJ(
-                self.rt_move_duration,
-                current_joint_positions,
-                joint_positions,
-            )
+            self._ensure_realtime_joint_loop_started()
+            self._rt_target_joint_positions = list(joint_positions)
             return joint_positions
 
         robot = self._require_robot()
@@ -239,8 +241,24 @@ class XCoreZionnerP1Client:
         self._robot = None
         self._rt_controller = None
         self._rt_configured = False
+        self._rt_loop_started = False
+        self._rt_target_joint_positions = None
+        self._rt_finish_loop = False
 
     def _disconnect_realtime(self, ec: dict[str, Any]) -> None:
+        rt_controller = self._require_rt_controller()
+        if self._rt_loop_started:
+            self._rt_finish_loop = True
+            try:
+                rt_controller.stopMove()
+            except Exception:
+                pass
+            try:
+                rt_controller.stopLoop()
+            except Exception:
+                pass
+            self._rt_loop_started = False
+
         robot = self._require_robot()
         try:
             robot.setMotionControlMode(
@@ -260,6 +278,29 @@ class XCoreZionnerP1Client:
         if self._rt_controller is None:
             raise XCoreSDKError("xCore realtime controller is not configured")
         return self._rt_controller
+
+    def _ensure_realtime_joint_loop_started(self) -> None:
+        if self._rt_loop_started:
+            return
+
+        rt_controller = self._require_rt_controller()
+        if self._rt_target_joint_positions is None:
+            self._rt_target_joint_positions = self.read_joint_positions()
+
+        self._rt_finish_loop = False
+        rt_controller.setControlLoopJoi(self._realtime_joint_callback)
+        rt_controller.startMove(self._sdk.RtControllerMode.jointPosition)
+        rt_controller.startLoop(False)
+        self._rt_loop_started = True
+
+    def _realtime_joint_callback(self) -> Any:
+        if self._rt_target_joint_positions is None:
+            raise XCoreSDKError("Realtime joint target is not initialized")
+
+        joint_position = self._sdk.JointPosition(self._rt_target_joint_positions)
+        if self._rt_finish_loop:
+            joint_position.setFinished(True)
+        return joint_position
 
 
 def _infer_local_ip_address(robot_ip_address: str) -> str:
