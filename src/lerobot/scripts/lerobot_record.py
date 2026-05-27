@@ -134,6 +134,11 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
+REPLAY_START_ALIGN_TIMEOUT_S = 5.0
+REPLAY_START_ALIGN_TOLERANCE_RAD = 0.03
+REPLAY_START_ALIGN_STEP_RAD = 0.01
+
+
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -454,6 +459,26 @@ def replay_record_loop(
     episode_index: int | None = None,
     control_time_s: int | float | None = None,
 ) -> dict[str, float | int]:
+    if not trajectory_frames:
+        return {
+            "frames": 0,
+            "total_observation_s": 0.0,
+            "total_action_s": 0.0,
+            "total_add_frame_s": 0.0,
+            "total_loop_s": 0.0,
+            "max_observation_s": 0.0,
+            "max_action_s": 0.0,
+            "max_loop_s": 0.0,
+            "trajectory_duration_s": 0.0,
+            "target_duration_s": 0.0,
+            "last_source_frame_index": 0,
+            "start_align_s": 0.0,
+            "start_align_iterations": 0,
+            "start_align_initial_max_abs_error": 0.0,
+            "start_align_final_max_abs_error": 0.0,
+            "start_aligned": 1,
+        }
+
     trajectory_timestamps = [
         float(frame.get("timestamp", index / fps))
         for index, frame in enumerate(trajectory_frames)
@@ -475,6 +500,73 @@ def replay_record_loop(
     max_loop_s = 0.0
     selected_frame_index = 0
     max_source_frame_index = 0
+    first_action = {
+        joint_name: float(value)
+        for joint_name, value in zip(
+            ZIONNER_P1_JOINTS,
+            trajectory_frames[0]["joints"],
+            strict=True,
+        )
+    }
+    start_align_t = time.perf_counter()
+    start_align_iterations = 0
+    current_joint_positions = {
+        joint_name: float(value)
+        for joint_name, value in zip(
+            ZIONNER_P1_JOINTS,
+            robot.client.read_joint_positions(),
+            strict=True,
+        )
+    }
+    initial_max_abs_error = max(
+        abs(current_joint_positions[joint_name] - target)
+        for joint_name, target in first_action.items()
+    )
+    final_max_abs_error = initial_max_abs_error
+    bridge_steps = max(
+        1,
+        int(initial_max_abs_error / REPLAY_START_ALIGN_STEP_RAD),
+    )
+    max_bridge_steps = max(1, int(REPLAY_START_ALIGN_TIMEOUT_S * fps))
+    bridge_steps = min(bridge_steps, max_bridge_steps)
+
+    for step_index in range(1, bridge_steps + 1):
+        if events["exit_early"] or events["stop_recording"]:
+            break
+
+        alpha = step_index / bridge_steps
+        bridge_action = {
+            joint_name: (
+                current_joint_positions[joint_name]
+                + alpha
+                * (
+                    first_action[joint_name]
+                    - current_joint_positions[joint_name]
+                )
+            )
+            for joint_name in ZIONNER_P1_JOINTS
+        }
+        robot_action_to_send = robot_action_processor(
+            (bridge_action, current_joint_positions)
+        )
+        robot.send_action(robot_action_to_send)
+        start_align_iterations += 1
+        busy_wait(1 / fps)
+
+    aligned_joint_positions = {
+        joint_name: float(value)
+        for joint_name, value in zip(
+            ZIONNER_P1_JOINTS,
+            robot.client.read_joint_positions(),
+            strict=True,
+        )
+    }
+    final_max_abs_error = max(
+        abs(aligned_joint_positions[joint_name] - target)
+        for joint_name, target in first_action.items()
+    )
+    start_aligned = final_max_abs_error <= REPLAY_START_ALIGN_TOLERANCE_RAD
+    start_align_duration_s = time.perf_counter() - start_align_t
     start_episode_t = time.perf_counter()
 
     while trajectory_frames:
@@ -562,6 +654,11 @@ def replay_record_loop(
         "trajectory_duration_s": trajectory_duration_s,
         "target_duration_s": target_duration_s,
         "last_source_frame_index": max_source_frame_index,
+        "start_align_s": start_align_duration_s,
+        "start_align_iterations": start_align_iterations,
+        "start_align_initial_max_abs_error": initial_max_abs_error,
+        "start_align_final_max_abs_error": final_max_abs_error,
+        "start_aligned": int(start_aligned),
     }
 
 
@@ -802,13 +899,18 @@ def record_replay_dataset(cfg: RecordConfig) -> LeRobotDataset:
                 control_time_s=cfg.dataset.episode_time_s,
             )
             logging.info(
-                "Replay episode %s summary: frames=%s wall=%.3fs trajectory_duration=%.3fs target_duration=%.3fs last_source_frame=%s obs_total=%.3fs action_total=%.3fs add_frame_total=%.3fs max_obs=%.3fs max_action=%.3fs max_loop=%.3fs",
+                "Replay episode %s summary: frames=%s wall=%.3fs trajectory_duration=%.3fs target_duration=%.3fs last_source_frame=%s start_align=%.3fs start_align_iterations=%s start_align_initial_max_abs_error=%.3frad start_align_final_max_abs_error=%.3frad start_aligned=%s obs_total=%.3fs action_total=%.3fs add_frame_total=%.3fs max_obs=%.3fs max_action=%.3fs max_loop=%.3fs",
                 current_episode_index,
                 replay_stats["frames"],
                 time.perf_counter() - episode_start_t,
                 replay_stats["trajectory_duration_s"],
                 replay_stats["target_duration_s"],
                 replay_stats["last_source_frame_index"],
+                replay_stats["start_align_s"],
+                replay_stats["start_align_iterations"],
+                replay_stats["start_align_initial_max_abs_error"],
+                replay_stats["start_align_final_max_abs_error"],
+                replay_stats["start_aligned"],
                 replay_stats["total_observation_s"],
                 replay_stats["total_action_s"],
                 replay_stats["total_add_frame_s"],

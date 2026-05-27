@@ -19,6 +19,7 @@ import platform
 import socket
 import sys
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 
@@ -70,6 +71,11 @@ def _assert_success(ec: dict[str, Any], action: str) -> None:
         raise XCoreSDKError(f"{action} failed: {ec}")
 
 
+def _is_robot_active_error(ec: dict[str, Any]) -> bool:
+    message = str(ec.get("message", ""))
+    return ec.get("ec") == -20 or "运动中" in message
+
+
 class XCoreZionnerP1Client:
     def __init__(
         self,
@@ -94,7 +100,9 @@ class XCoreZionnerP1Client:
         self._rt_configured = False
         self._rt_loop_started = False
         self._rt_target_joint_positions: list[float] | None = None
+        self._rt_command_joint_positions: list[float] | None = None
         self._rt_finish_loop = False
+        self._rt_finish_ack = Event()
         self._is_connected = False
 
     @property
@@ -128,6 +136,10 @@ class XCoreZionnerP1Client:
         robot = self._require_robot()
         ec: dict[str, Any] = {}
         robot.setOperateMode(self._sdk.OperateMode.automatic, ec)
+        if _is_robot_active_error(ec):
+            self._recover_robot_to_idle()
+            ec = {}
+            robot.setOperateMode(self._sdk.OperateMode.automatic, ec)
         _assert_success(ec, "setOperateMode")
         robot.setRtNetworkTolerance(self.rt_network_tolerance, ec)
         _assert_success(ec, "setRtNetworkTolerance")
@@ -142,7 +154,9 @@ class XCoreZionnerP1Client:
         self._rt_configured = True
         self._rt_loop_started = False
         self._rt_target_joint_positions = None
+        self._rt_command_joint_positions = None
         self._rt_finish_loop = False
+        self._rt_finish_ack.clear()
 
     def configure_joint_control(self, force: bool = False) -> None:
         if self.use_realtime:
@@ -243,12 +257,15 @@ class XCoreZionnerP1Client:
         self._rt_configured = False
         self._rt_loop_started = False
         self._rt_target_joint_positions = None
+        self._rt_command_joint_positions = None
         self._rt_finish_loop = False
+        self._rt_finish_ack.clear()
 
     def _disconnect_realtime(self, ec: dict[str, Any]) -> None:
         rt_controller = self._require_rt_controller()
         if self._rt_loop_started:
             self._rt_finish_loop = True
+            self._rt_finish_ack.wait(timeout=max(self.rt_move_duration, 0.1))
             try:
                 rt_controller.stopMove()
             except Exception:
@@ -268,6 +285,35 @@ class XCoreZionnerP1Client:
             _assert_success(ec, "setMotionControlMode")
         except XCoreSDKError:
             pass
+        try:
+            robot.setOperateMode(self._sdk.OperateMode.manual, ec)
+            _assert_success(ec, "setOperateMode")
+        except XCoreSDKError:
+            pass
+        try:
+            robot.setPowerState(False, ec)
+            _assert_success(ec, "setPowerState")
+        except XCoreSDKError:
+            pass
+
+    def _recover_robot_to_idle(self) -> None:
+        robot = self._require_robot()
+        recovery_ec: dict[str, Any] = {}
+        try:
+            robot.setMotionControlMode(
+                self._sdk.MotionControlMode.NrtCommandMode,
+                recovery_ec,
+            )
+        except Exception:
+            pass
+        try:
+            robot.setOperateMode(self._sdk.OperateMode.manual, recovery_ec)
+        except Exception:
+            pass
+        try:
+            robot.setPowerState(False, recovery_ec)
+        except Exception:
+            pass
 
     def _require_robot(self) -> Any:
         if not self._is_connected or self._robot is None:
@@ -286,6 +332,10 @@ class XCoreZionnerP1Client:
         rt_controller = self._require_rt_controller()
         if self._rt_target_joint_positions is None:
             self._rt_target_joint_positions = self.read_joint_positions()
+        if self._rt_command_joint_positions is None:
+            self._rt_command_joint_positions = list(
+                self._rt_target_joint_positions
+            )
 
         self._rt_finish_loop = False
         rt_controller.setControlLoopJoi(self._realtime_joint_callback)
@@ -296,9 +346,35 @@ class XCoreZionnerP1Client:
     def _realtime_joint_callback(self) -> Any:
         if self._rt_target_joint_positions is None:
             raise XCoreSDKError("Realtime joint target is not initialized")
+        if self._rt_command_joint_positions is None:
+            self._rt_command_joint_positions = list(
+                self._rt_target_joint_positions
+            )
 
-        joint_position = self._sdk.JointPosition(self._rt_target_joint_positions)
+        # The xCore realtime joint loop behaves as a follow controller.
+        # Large one-shot setpoint jumps are accepted but may not be executed.
+        # Ramp the command toward the latest target in small RT steps instead.
+        rt_step = 0.002
+        next_command: list[float] = []
+        for current, target in zip(
+            self._rt_command_joint_positions,
+            self._rt_target_joint_positions,
+            strict=True,
+        ):
+            delta = target - current
+            if delta > rt_step:
+                next_command.append(current + rt_step)
+            elif delta < -rt_step:
+                next_command.append(current - rt_step)
+            else:
+                next_command.append(target)
+        self._rt_command_joint_positions = next_command
+
+        joint_position = self._sdk.JointPosition()
+        joint_position.joints = list(self._rt_command_joint_positions)
+        joint_position.external = []
         if self._rt_finish_loop:
+            self._rt_finish_ack.set()
             joint_position.setFinished(True)
         return joint_position
 
