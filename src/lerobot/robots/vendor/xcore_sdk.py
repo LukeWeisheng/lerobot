@@ -86,6 +86,7 @@ class XCoreZionnerP1Client:
         use_realtime: bool = False,
         rt_move_duration: float = 0.05,
         rt_network_tolerance: int = 100,
+        rt_joint_step: float = 0.0005,
     ):
         self.ip_address = ip_address
         self.local_ip_address = local_ip_address
@@ -94,6 +95,7 @@ class XCoreZionnerP1Client:
         self.use_realtime = use_realtime
         self.rt_move_duration = rt_move_duration
         self.rt_network_tolerance = rt_network_tolerance
+        self.rt_joint_step = rt_joint_step
         self._sdk: Any | None = None
         self._robot: Any | None = None
         self._rt_controller: Any | None = None
@@ -354,7 +356,6 @@ class XCoreZionnerP1Client:
         # The xCore realtime joint loop behaves as a follow controller.
         # Large one-shot setpoint jumps are accepted but may not be executed.
         # Ramp the command toward the latest target in small RT steps instead.
-        rt_step = 0.002
         next_command: list[float] = []
         for current, target in zip(
             self._rt_command_joint_positions,
@@ -362,10 +363,10 @@ class XCoreZionnerP1Client:
             strict=True,
         ):
             delta = target - current
-            if delta > rt_step:
-                next_command.append(current + rt_step)
-            elif delta < -rt_step:
-                next_command.append(current - rt_step)
+            if delta > self.rt_joint_step:
+                next_command.append(current + self.rt_joint_step)
+            elif delta < -self.rt_joint_step:
+                next_command.append(current - self.rt_joint_step)
             else:
                 next_command.append(target)
         self._rt_command_joint_positions = next_command

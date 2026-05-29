@@ -51,6 +51,7 @@ class ZionnerP1Follower(Robot):
             use_realtime=config.use_realtime,
             rt_move_duration=config.rt_move_duration,
             rt_network_tolerance=config.rt_network_tolerance,
+            rt_joint_step=config.rt_joint_step,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
 

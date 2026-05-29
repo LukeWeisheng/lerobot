@@ -97,20 +97,29 @@ def predict_action(
     Returns:
         A `torch.Tensor` containing the predicted action, ready for the robot.
     """
-    observation = copy(observation)
-    with (
-        torch.inference_mode(),
-        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
-    ):
-        # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
-        observation = prepare_observation_for_inference(observation, device, task, robot_type)
-        observation = preprocessor(observation)
+    raw_observation = copy(observation)
 
-        # Compute the next action with the policy
-        # based on the current observation
-        action = policy.select_action(observation)
+    def run_inference(enable_amp: bool):
+        observation_batch = prepare_observation_for_inference(
+            copy(raw_observation), device, task, robot_type
+        )
+        observation_batch = preprocessor(observation_batch)
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=device.type) if device.type == "cuda" and enable_amp else nullcontext(),
+        ):
+            action_batch = policy.select_action(observation_batch)
+            action_batch = postprocessor(action_batch)
+        return action_batch
 
-        action = postprocessor(action)
+    action = run_inference(device.type == "cuda" and use_amp)
+
+    if device.type == "cuda" and use_amp and not torch.isfinite(action).all():
+        logging.warning("Policy produced non-finite action with AMP; retrying inference in float32.")
+        policy.reset()
+        preprocessor.reset()
+        postprocessor.reset()
+        action = run_inference(False)
 
     return action
 

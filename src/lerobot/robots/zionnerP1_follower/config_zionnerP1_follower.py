@@ -33,6 +33,7 @@ class ZionnerP1FollowerConfig(RobotConfig):
     use_realtime: bool = True
     rt_move_duration: float = 0.05
     rt_network_tolerance: int = 100
+    rt_joint_step: float = 0.0005
     enable_default_cameras: bool = True
     arm_camera_serial_number: str = "CP2N1630006X"
     head_camera_serial_number: str = "CP26363000BJ"

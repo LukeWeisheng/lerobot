@@ -136,7 +136,7 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 REPLAY_START_ALIGN_TIMEOUT_S = 5.0
 REPLAY_START_ALIGN_TOLERANCE_RAD = 0.03
-REPLAY_START_ALIGN_STEP_RAD = 0.01
+REPLAY_START_ALIGN_STEP_RAD = 0.003
 
 
 @dataclass
@@ -1062,18 +1062,21 @@ def record_normal(cfg: RecordConfig) -> LeRobotDataset:
                 (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
             ):
                 log_say("Reset the environment", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    control_time_s=cfg.dataset.reset_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                )
+                if teleop is None:
+                    passive_wait_loop(events, cfg.dataset.reset_time_s)
+                else:
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        control_time_s=cfg.dataset.reset_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                    )
 
             if events["rerecord_episode"]:
                 log_say("Re-record episode", cfg.play_sounds)
